@@ -1,23 +1,13 @@
 """
-basket.py — Backtesting EN VIVO de Divergencia Armónica ETH/SOL/BTC
-Lee precios REALES del order book de Polymarket — SIN ejecutar órdenes reales.
+basket_soft.py — Divergencia Armónica ETH/SOL/BTC  [SOFT]
 
-LOGICA BINARIA CORRECTA:
-  Los tokens de Polymarket resuelven en 0 o 1 (todo o nada).
-  Cada entrada cuesta exactamente $1.00 (el 1% del capital de $100).
-  Shares comprados = $1.00 / precio_ask
+Idéntico a basket.py v5 con 3 diferencias:
+  1. CONSENSUS_SOFT = 0.55  (era 0.80) — basta con que 1 par esté > 0.55
+  2. Entra con consenso SOFT  (basket normal solo acepta FULL)
+  3. Sin DIVERGENCE_MAX      (acepta gaps de cualquier tamaño >= threshold)
 
-CAMBIOS v4:
-  - ENTRY_WINDOW_SECS = 85 (era 90) → elimina franja 85-90s que era PnL negativo
-  - DIVERGENCE_THRESHOLD = 0.05 (era 0.04) → gap mínimo 5pts
-  - DIVERGENCE_MAX = 0.14 → gap máximo 14pts, descarta divergencias anómalas
-  Resultado histórico con estos 3 filtros: WR=80%, PF=2.44, MaxDD=$2.29
-
-CAMBIOS v5:
-  - ELIMINADO Gamma API — ya no se consulta fetch_market_resolution
-  - Resolución fallback: promedio de las últimas 3 muestras CLOB del activo
-  - Si up_mid_avg > 0.5 → UP, si < 0.5 → DOWN, si == 0.5 → LOSS conservador
-  - Cero bloqueos: resolución inmediata al expirar el mercado
+Todo lo demás igual: misma detección armónica, mismo lado de entrada (el barato),
+mismo stop loss, misma resolución CLOB.
 """
 
 import asyncio
@@ -42,7 +32,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stdout,
 )
-log = logging.getLogger("basket")
+log = logging.getLogger("basket_soft")
 
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -51,8 +41,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 #  PARÁMETROS
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
-DIVERGENCE_THRESHOLD = 0.05
-DIVERGENCE_MAX       = 0.14
+DIVERGENCE_THRESHOLD = 0.05    # gap mínimo — igual que basket
+# Sin DIVERGENCE_MAX — acepta cualquier gap >= 5bp
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
 ENTRY_OPEN_SECS      = 60
@@ -66,18 +56,17 @@ RESOLVED_UP_THRESH   = 0.98
 RESOLVED_DN_THRESH   = 0.02
 
 CONSENSUS_FULL       = 0.80
-CONSENSUS_SOFT       = 0.80
+CONSENSUS_SOFT       = 0.55    # ← CAMBIO: era 0.80, ahora 0.55
 
 ENTRY_MIN_PRICE      = 0.65
 
 STOP_LOSS_PRICE      = 0.33
 
-# Cuántas muestras CLOB guardar por símbolo para el fallback
 MID_HISTORY_SIZE     = 3
 
-LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
-CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
-STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
+LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_soft_log.json")
+CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_soft_trades.csv")
+STATE_FILE = os.environ.get("STATE_FILE", "/data/basket_soft_state.json")
 
 # ═══════════════════════════════════════════════════════
 #  ESTADO DE LOS 3 MERCADOS
@@ -95,7 +84,6 @@ markets = {
     for s in SYMBOLS
 }
 
-# Historial de up_mid por símbolo — usado para resolución fallback
 mid_history: dict[str, deque] = {
     s: deque(maxlen=MID_HISTORY_SIZE) for s in SYMBOLS
 }
@@ -108,7 +96,7 @@ bt = {
     "signal_div":   0.0,
     "entry_window": False,
     "position":     None,
-    "pending_resolution": None,   # mantenido por compatibilidad, nunca se usa
+    "pending_resolution": None,
     "traded_this_cycle": False,
     "capital":      CAPITAL_TOTAL,
     "total_pnl":    0.0,
@@ -188,19 +176,10 @@ def update_drawdown():
 
 
 # ═══════════════════════════════════════════════════════
-#  RESOLUCIÓN FALLBACK — CLOB (SIN GAMMA)
+#  RESOLUCIÓN FALLBACK — CLOB
 # ═══════════════════════════════════════════════════════
 
 def resolve_from_clob_history(sym: str) -> str:
-    """
-    Usa el promedio de las últimas MID_HISTORY_SIZE muestras de up_mid
-    para determinar el ganador cuando el mercado expira sin precio concluyente.
-
-    Regla:
-      avg > 0.5  →  UP ganó
-      avg < 0.5  →  DOWN ganó
-      avg == 0.5 →  LOSS conservador (empate técnico)
-    """
     history = list(mid_history[sym])
     if not history:
         log_event(f"FALLBACK {sym}: sin historial CLOB — asumiendo LOSS")
@@ -252,7 +231,7 @@ def write_state():
         "signal_side": bt["signal_side"],
         "signal_div": round(bt["signal_div"], 4),
         "position": bt["position"],
-        "pending_resolution": None,   # siempre None en v5
+        "pending_resolution": None,
         "markets": {
             sym: {
                 "up_mid": round(markets[sym]["up_mid"], 4),
@@ -321,7 +300,6 @@ async def discover_all():
             if info:
                 markets[sym]["info"]  = info
                 markets[sym]["error"] = None
-                # Limpiar historial al descubrir ciclo nuevo
                 mid_history[sym].clear()
                 log_event(f"{sym}: mercado encontrado — {info.get('question','')[:50]}")
             else:
@@ -368,7 +346,6 @@ async def fetch_one(sym: str):
             markets[sym]["up_mid"] = up_mid
             markets[sym]["dn_mid"] = calc_mid(dn_metrics["best_bid"], dn_metrics["best_ask"])
 
-            # ── Acumular historial de up_mid para resolución fallback ──
             if up_mid > 0:
                 mid_history[sym].append(up_mid)
 
@@ -457,22 +434,19 @@ def check_entry():
         return
     if not bt["entry_window"]:
         return
-    if bt["consensus"] != "FULL":
+
+    # ← CAMBIO: acepta SOFT además de FULL
+    if bt["consensus"] not in ("FULL", "SOFT"):
         bt["skipped"] += 1
         return
+
     if not bt["signal_asset"]:
         return
 
     div_abs = abs(bt["signal_div"])
     if div_abs < DIVERGENCE_THRESHOLD:
         return
-    if div_abs > DIVERGENCE_MAX:
-        log_event(
-            f"SKIP — gap={div_abs*100:.1f}pts excede máximo {DIVERGENCE_MAX*100:.0f}pts "
-            f"(divergencia anómala, posible mercado roto)"
-        )
-        bt["skipped"] += 1
-        return
+    # Sin DIVERGENCE_MAX — cualquier gap >= threshold es válido
 
     sym  = bt["signal_asset"]
     side = bt["signal_side"]
@@ -498,19 +472,17 @@ def check_entry():
         return
 
     if entry_ask < ENTRY_MIN_PRICE:
-        log_event(
-            f"SKIP {side} {sym} — ask={entry_ask:.4f} bajo mínimo {ENTRY_MIN_PRICE}"
-        )
+        log_event(f"SKIP {side} {sym} — ask={entry_ask:.4f} bajo mínimo {ENTRY_MIN_PRICE}")
         bt["skipped"] += 1
         return
 
     shares = round(ENTRY_USD / entry_ask, 6)
     secs   = min_secs_remaining() or 0
 
-    peers        = [s for s in SYMBOLS if s != sym]
-    peer_snaps   = {p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]} for p in peers}
-    harm_entry   = bt["harm_up"] if side == "UP" else bt["harm_dn"]
-    gap_entry    = bt["signal_div"]
+    peers          = [s for s in SYMBOLS if s != sym]
+    peer_snaps     = {p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]} for p in peers}
+    harm_entry     = bt["harm_up"] if side == "UP" else bt["harm_dn"]
+    gap_entry      = bt["signal_div"]
     capital_before = bt["capital"]
 
     bt["capital"] -= ENTRY_USD
@@ -539,7 +511,7 @@ def check_entry():
     log_event(
         f"ENTRADA {side} {sym} @ ask={entry_ask:.4f} | "
         f"div={gap_entry*100:+.1f}pts | arm={harm_entry:.4f} | "
-        f"shares={shares:.4f} | capital=${bt['capital']:.2f}"
+        f"consensus={bt['consensus']} | shares={shares:.4f} | capital=${bt['capital']:.2f}"
     )
     write_state()
 
@@ -586,14 +558,6 @@ def _apply_resolution(pos, resolved):
 
 
 def check_resolution():
-    """
-    Resolución sin Gamma.
-    Flujo:
-      1. Precio CLOB concluyente (≥0.98 / ≤0.02) → resolución inmediata.
-      2. Mercado expirado (info=None) pero sin precio concluyente →
-         fallback: promedio de las últimas MID_HISTORY_SIZE muestras de up_mid.
-      3. Si el historial está vacío → LOSS conservador + log de advertencia.
-    """
     pos = bt["position"]
     if not pos:
         return
@@ -601,7 +565,6 @@ def check_resolution():
     sym    = pos["asset"]
     up_mid = markets[sym]["up_mid"]
 
-    # 1. Precio concluyente en CLOB
     resolved = None
     if up_mid >= RESOLVED_UP_THRESH:
         resolved = "UP"
@@ -613,12 +576,10 @@ def check_resolution():
         bt["position"] = None
         return
 
-    # 2. Mercado expirado sin precio concluyente → fallback CLOB
     if markets[sym]["info"] is None:
         resolved = resolve_from_clob_history(sym)
 
         if resolved == "_UNKNOWN":
-            # Sin historial ni precio — LOSS conservador
             log_event(f"FALLBACK {sym}: resolución imposible — LOSS conservador")
             pnl = -ENTRY_USD
             bt["capital"]   += ENTRY_USD + pnl
@@ -729,16 +690,17 @@ def _save_log():
     with open(LOG_FILE, "w") as f:
         json.dump({
             "summary": {
-                "capital_inicial": CAPITAL_TOTAL,
-                "capital_actual":  round(bt["capital"], 4),
-                "total_pnl_usd":   round(bt["total_pnl"], 4),
-                "roi_pct":         round((bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100, 2),
-                "max_drawdown":    round(bt["max_drawdown"], 4),
-                "wins":            bt["wins"],
-                "losses":          bt["losses"],
-                "win_rate":        round(bt["wins"] / total * 100, 1) if total else 0,
-                "skipped":         bt["skipped"],
-                "entry_usd":       ENTRY_USD,
+                "capital_inicial":           CAPITAL_TOTAL,
+                "capital_actual":            round(bt["capital"], 4),
+                "total_pnl_usd":             round(bt["total_pnl"], 4),
+                "roi_pct":                   round((bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100, 2),
+                "max_drawdown":              round(bt["max_drawdown"], 4),
+                "wins":                      bt["wins"],
+                "losses":                    bt["losses"],
+                "win_rate":                  round(bt["wins"] / total * 100, 1) if total else 0,
+                "skipped":                   bt["skipped"],
+                "entry_usd":                 ENTRY_USD,
+                "consensus_soft_threshold":  CONSENSUS_SOFT,
             },
             "trades": bt["trades"],
         }, f, indent=2)
@@ -749,9 +711,9 @@ def _save_log():
 # ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    log_event("basket.py iniciado — SIMULACION BINARIA v5 (sin Gamma)")
+    log_event("basket_soft.py iniciado — DIVERGENCIA ARMÓNICA [SOFT]")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} ≤{DIVERGENCE_MAX:.0%} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s (zona dorada)")
+    log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} (sin máximo) | Consenso SOFT>={CONSENSUS_SOFT} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s")
 
     restore_state_from_csv()
 
@@ -842,9 +804,10 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 54)
-    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v5")
+    log.info("  BASKET SOFT — DIVERGENCIA ARMONICA  [SOFT]")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log.info(f"  Gap: {DIVERGENCE_THRESHOLD*100:.0f}pts — {DIVERGENCE_MAX*100:.0f}pts  |  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
+    log.info(f"  Gap: >={DIVERGENCE_THRESHOLD*100:.0f}pts (sin máximo)  |  Consenso SOFT>={CONSENSUS_SOFT}")
+    log.info(f"  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s  |  SL: {STOP_LOSS_PRICE}")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
@@ -855,7 +818,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
-        log.info("Basket detenido.")
+        log.info("Basket SOFT detenido.")
         total = bt["wins"] + bt["losses"]
         roi   = (bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100
         log.info(f"Capital final: ${bt['capital']:.4f}  (ROI: {roi:+.2f}%)")
